@@ -24,6 +24,8 @@ from typing import Optional
 
 try:
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 except ImportError:
     sys.exit("Missing dependency: pip install requests python-dotenv")
 
@@ -151,17 +153,31 @@ def plain_text(prop: dict, prop_type: str = "rich_text") -> str:
 
 # ── Asana helpers ─────────────────────────────────────────────────────────────
 
+_retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "PUT"],
+    raise_on_status=False,
+)
+_asana_session = requests.Session()
+_asana_session.mount("https://", HTTPAdapter(max_retries=_retry))
+
+
 def a_get(path: str, params: Optional[dict] = None) -> dict:
-    r = requests.get(f"{ASANA_API}{path}", headers=ASANA_HEADERS, params=params)
+    r = _asana_session.get(
+        f"{ASANA_API}{path}", headers=ASANA_HEADERS, params=params, timeout=30
+    )
     r.raise_for_status()
     return r.json()
 
 
 def a_update_task(gid: str, completed: bool) -> None:
-    r = requests.put(
+    r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
         headers=ASANA_HEADERS,
         json={"data": {"completed": completed}},
+        timeout=30,
     )
     r.raise_for_status()
 
