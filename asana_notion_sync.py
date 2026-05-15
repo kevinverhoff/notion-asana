@@ -172,6 +172,16 @@ def a_get(path: str, params: Optional[dict] = None) -> dict:
     return r.json()
 
 
+def a_update_task_due(gid: str, due_on: Optional[str]) -> None:
+    r = _asana_session.put(
+        f"{ASANA_API}/tasks/{gid}",
+        headers=ASANA_HEADERS,
+        json={"data": {"due_on": due_on}},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
 def a_update_task(gid: str, completed: bool) -> None:
     r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
@@ -248,6 +258,7 @@ def sync() -> str:
         "new_projects": 0,
         "pushed": 0,
         "done_from_asana": 0,
+        "due_date_pushed": 0,
     }
 
     # PART 0: Refresh project mapping
@@ -296,10 +307,15 @@ def sync() -> str:
             has_domains = bool(
                 page["properties"].get("Domains", {}).get("relation", [])
             )
+            notion_due = (
+                (page["properties"].get("Due Date", {}).get("date") or {})
+                .get("start")
+            )
             notion_map[asana_id] = {
                 "page_id": page["id"],
                 "status": status_name,
                 "has_domains": has_domains,
+                "due_date": notion_due,
             }
 
     # Create or update a Notion task entry for each Asana task
@@ -346,7 +362,17 @@ def sync() -> str:
                     "Last Synced": n_date(TODAY),
                     "Projects": n_relation(project_page_ids),
                 }
-                if due_on:
+                notion_due = existing.get("due_date")
+                if notion_due and notion_due != due_on:
+                    # Notion has a date that differs from Asana → push to Asana
+                    a_update_task_due(gid, notion_due)
+                    counts["due_date_pushed"] += 1
+                    log.info(
+                        "  Due date pushed to Asana for '%s': %s → %s",
+                        name, due_on, notion_due,
+                    )
+                elif not notion_due and due_on:
+                    # Notion has no date but Asana does → populate Notion
                     props["Due Date"] = n_date(due_on)
                 # Only touch Domains if the page has none set yet
                 if not existing["has_domains"]:
@@ -425,7 +451,7 @@ def sync() -> str:
         f"Synced {total_synced} tasks at {timestamp}. "
         f"Pull: {counts['new']} new, {counts['updated']} updated. "
         f"Projects: {counts['new_projects']} new (add Tasks + Meeting Notes views manually). "
-        f"Push: {counts['pushed']} closed in Asana. "
+        f"Push: {counts['pushed']} closed in Asana, {counts['due_date_pushed']} due dates updated in Asana. "
         f"{counts['done_from_asana']} marked Done from Asana side."
     )
     print(summary)
