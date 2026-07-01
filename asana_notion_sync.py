@@ -122,6 +122,65 @@ def n_update_page(page_id: str, props: dict) -> dict:
     return r.json()
 
 
+def n_archive_page(page_id: str) -> None:
+    r = requests.patch(
+        f"{NOTION_API}/pages/{page_id}",
+        headers=NOTION_HEADERS,
+        json={"archived": True},
+    )
+    r.raise_for_status()
+
+
+def n_get_blocks(page_id: str) -> list[dict]:
+    """Fetch all top-level child blocks from a Notion page."""
+    blocks: list[dict] = []
+    params: dict = {"page_size": 100}
+    while True:
+        r = requests.get(
+            f"{NOTION_API}/blocks/{page_id}/children",
+            headers=NOTION_HEADERS,
+            params=params,
+        )
+        r.raise_for_status()
+        body = r.json()
+        blocks.extend(body.get("results", []))
+        if not body.get("has_more"):
+            break
+        params["start_cursor"] = body["next_cursor"]
+    return blocks
+
+
+_BLOCK_READONLY = {
+    "id", "created_time", "last_edited_time", "created_by",
+    "last_edited_by", "has_children", "archived", "in_trash",
+    "parent", "object",
+}
+
+
+def _clean_block(block: dict) -> Optional[dict]:
+    """Strip read-only fields from a block so it can be re-appended."""
+    block_type = block.get("type")
+    if not block_type or block_type == "unsupported":
+        return None
+    type_data = {k: v for k, v in block.get(block_type, {}).items() if k != "children"}
+    return {"type": block_type, block_type: type_data}
+
+
+def n_append_blocks(page_id: str, blocks: list[dict]) -> None:
+    """Append cleaned blocks to a Notion page in batches of 100."""
+    clean = [_clean_block(b) for b in blocks]
+    clean = [b for b in clean if b is not None]
+    if not clean:
+        return
+    for i in range(0, len(clean), 100):
+        r = requests.patch(
+            f"{NOTION_API}/blocks/{page_id}/children",
+            headers=NOTION_HEADERS,
+            json={"children": clean[i : i + 100]},
+        )
+        r.raise_for_status()
+
+
 # Notion property builders
 
 def n_title(value: str) -> dict:
@@ -281,13 +340,22 @@ def sync() -> str:
 
     for proj_name in sorted(all_project_names):
         if proj_name not in project_map:
-            log.info("  New project detected: '%s'", proj_name)
-            try:
-                page = create_notion_project(proj_name)
-                project_map[proj_name] = {"page_id": page["id"], "url": page.get("url", "")}
-                counts["new_projects"] += 1
-            except Exception as exc:
-                log.error("  Failed to create project '%s': %s", proj_name, exc)
+            # Live check before creating — guards against stale startup snapshot
+            live = n_query(PROJECTS_DB, {
+                "property": "Project Name",
+                "title": {"equals": proj_name},
+            })
+            if live:
+                project_map[proj_name] = {"page_id": live[0]["id"], "url": live[0].get("url", "")}
+                log.info("  Project '%s' found via live check (not in initial snapshot)", proj_name)
+            else:
+                log.info("  New project detected: '%s'", proj_name)
+                try:
+                    page = create_notion_project(proj_name)
+                    project_map[proj_name] = {"page_id": page["id"], "url": page.get("url", "")}
+                    counts["new_projects"] += 1
+                except Exception as exc:
+                    log.error("  Failed to create project '%s': %s", proj_name, exc)
 
     # Build Asana ID → Notion page info map (Source = "Asana" only)
     log.info("  Querying existing Notion All Tasks (Source=Asana)...")
@@ -458,6 +526,93 @@ def sync() -> str:
     return summary
 
 
+def merge_duplicate_projects(dry_run: bool = False) -> None:
+    """
+    Find project pages in Notion that share the same name and merge them.
+
+    For each duplicate group:
+      1. Pick the first page as canonical.
+      2. Re-point every task's Projects relation from each dupe → canonical.
+      3. Copy block content from each dupe into canonical (with a divider).
+      4. Archive each dupe.
+
+    Pass dry_run=True to log what would happen without making any changes.
+    """
+    from collections import defaultdict
+
+    log.info("Loading all Notion projects...")
+    project_pages = n_query(PROJECTS_DB)
+
+    name_groups: dict[str, list[dict]] = defaultdict(list)
+    for page in project_pages:
+        name = plain_text(page["properties"].get("Project Name", {}), "title").strip()
+        if name:
+            name_groups[name].append(page)
+
+    dupes = {name: pages for name, pages in name_groups.items() if len(pages) > 1}
+
+    if not dupes:
+        log.info("No duplicate projects found.")
+        return
+
+    log.info("Found %d duplicate project name(s):", len(dupes))
+    for name, pages in dupes.items():
+        log.info("  '%s' — %d copies", name, len(pages))
+
+    for name, pages in dupes.items():
+        canonical = pages[0]
+        canonical_id = canonical["id"]
+        log.info("\nMerging '%s' — keeping %s", name, canonical_id)
+
+        for dupe in pages[1:]:
+            dupe_id = dupe["id"]
+            log.info("  Processing dupe: %s", dupe_id)
+
+            # Re-point tasks
+            tasks = n_query(ALL_TASKS_DB, {
+                "property": "Projects",
+                "relation": {"contains": dupe_id},
+            })
+            log.info("    %d task(s) reference this dupe", len(tasks))
+            for task_page in tasks:
+                current_ids = {r["id"] for r in task_page["properties"].get("Projects", {}).get("relation", [])}
+                new_ids = (current_ids - {dupe_id}) | {canonical_id}
+                if not dry_run:
+                    n_update_page(task_page["id"], {"Projects": n_relation(list(new_ids))})
+                    log.info("    Updated task %s", task_page["id"])
+
+            # Copy block content
+            blocks = n_get_blocks(dupe_id)
+            if blocks:
+                log.info("    Copying %d block(s) of content", len(blocks))
+                if not dry_run:
+                    # Prepend a divider and attribution callout so merged content is traceable
+                    n_append_blocks(canonical_id, [
+                        {"type": "divider", "divider": {}},
+                        {
+                            "type": "callout",
+                            "callout": {
+                                "rich_text": [{"type": "text", "text": {
+                                    "content": f"Merged from duplicate page {dupe_id}"
+                                }}],
+                                "icon": {"type": "emoji", "emoji": "🔀"},
+                                "color": "gray_background",
+                            },
+                        },
+                    ])
+                    n_append_blocks(canonical_id, blocks)
+
+            # Archive the dupe
+            log.info("    Archiving dupe %s", dupe_id)
+            if not dry_run:
+                n_archive_page(dupe_id)
+
+    if dry_run:
+        log.info("\nDRY RUN complete — no changes made.")
+    else:
+        log.info("\nMerge complete.")
+
+
 def discover():
     """Print all Notion databases visible to this integration token."""
     print("Searching for databases accessible to your integration...\n")
@@ -485,8 +640,12 @@ def discover():
 
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--discover":
         discover()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--merge-dupes":
+        dry_run = "--dry-run" in sys.argv
+        if dry_run:
+            log.info("DRY RUN mode — no changes will be made")
+        merge_duplicate_projects(dry_run=dry_run)
     else:
         sync()
