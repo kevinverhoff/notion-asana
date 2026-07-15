@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Asana <-> Notion bidirectional task sync.
 
@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Credentials ───────────────────────────────────────────────────────────────
+# â”€â”€ Credentials â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 ASANA_TOKEN = os.environ.get("ASANA_TOKEN", "")
@@ -51,7 +51,7 @@ ASANA_TOKEN = os.environ.get("ASANA_TOKEN", "")
 if not NOTION_TOKEN or not ASANA_TOKEN:
     sys.exit("Set NOTION_TOKEN and ASANA_TOKEN environment variables before running.")
 
-# ── Static IDs ────────────────────────────────────────────────────────────────
+# â”€â”€ Static IDs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 NOTION_API = "https://api.notion.com/v1"
 ASANA_API = "https://app.asana.com/api/1.0"
@@ -79,7 +79,7 @@ ASANA_HEADERS = {
 }
 
 
-# ── Notion helpers ────────────────────────────────────────────────────────────
+# â”€â”€ Notion helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def n_query(db_id: str, filter_payload: Optional[dict] = None) -> list[dict]:
     """Query all pages from a Notion database, handling pagination."""
@@ -210,7 +210,7 @@ def plain_text(prop: dict, prop_type: str = "rich_text") -> str:
     return "".join(t.get("plain_text", "") for t in prop.get(prop_type, []))
 
 
-# ── Asana helpers ─────────────────────────────────────────────────────────────
+# â”€â”€ Asana helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _retry = Retry(
     total=3,
@@ -265,7 +265,7 @@ def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
     params: dict = {
         "assignee.any": ASANA_USER_GID,
         "completed": "false",
-        "opt_fields": "gid,name,due_on,projects.name,permalink_url,completed,modified_at",
+        "opt_fields": "gid,name,due_on,projects,projects.name,permalink_url,completed,modified_at",
         "limit": 100,
     }
     while True:
@@ -278,7 +278,7 @@ def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
     return tasks
 
 
-# ── Project helpers ───────────────────────────────────────────────────────────
+# â”€â”€ Project helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_project_map(pages: list[dict]) -> dict[str, dict]:
     """Return {project_name: {page_id, url}} from Notion Projects query results."""
@@ -304,11 +304,11 @@ def create_notion_project(name: str) -> dict:
         "Domains": n_relation([KTAF_DOMAIN_PAGE_ID]),
     }
     page = n_create_page(PROJECTS_DB, props)
-    log.info("  Created Notion project '%s' → %s", name, page["id"])
+    log.info("  Created Notion project '%s' â†’ %s", name, page["id"])
     return page
 
 
-# ── Main sync ─────────────────────────────────────────────────────────────────
+# â”€â”€ Main sync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def sync() -> str:
     counts = {
@@ -326,21 +326,24 @@ def sync() -> str:
     project_map = build_project_map(project_pages)
     log.info("  %d existing projects found", len(project_map))
 
-    # PART 1: Asana → Notion (pull)
+    # PART 1: Asana â†’ Notion (pull)
     log.info("Part 1: Fetching incomplete tasks from Asana...")
     workspace_gid = asana_workspace_gid()
     asana_tasks = asana_fetch_incomplete_tasks(workspace_gid)
     log.info("  %d incomplete Asana tasks fetched", len(asana_tasks))
+    log.info("  %d tasks have project memberships", sum(1 for t in asana_tasks if t.get("projects")))
 
     # Ensure every Asana project name has a matching Notion project page
     all_project_names: set[str] = set()
     for task in asana_tasks:
         for proj in task.get("projects") or []:
-            all_project_names.add(proj["name"])
+            pname = proj.get("name")
+            if pname:
+                all_project_names.add(pname)
 
     for proj_name in sorted(all_project_names):
         if proj_name not in project_map:
-            # Live check before creating — guards against stale startup snapshot
+            # Live check before creating â€” guards against stale startup snapshot
             live = n_query(PROJECTS_DB, {
                 "property": "Project Name",
                 "title": {"equals": proj_name},
@@ -357,7 +360,7 @@ def sync() -> str:
                 except Exception as exc:
                     log.error("  Failed to create project '%s': %s", proj_name, exc)
 
-    # Build Asana ID → Notion page info map (Source = "Asana" only)
+    # Build Asana ID â†’ Notion page info map (Source = "Asana" only)
     log.info("  Querying existing Notion All Tasks (Source=Asana)...")
     notion_asana_pages = n_query(
         ALL_TASKS_DB,
@@ -394,7 +397,7 @@ def sync() -> str:
         name = task.get("name", "")
         due_on = task.get("due_on")
         permalink = task.get("permalink_url", "")
-        project_names = [p["name"] for p in (task.get("projects") or [])]
+        project_names = [p["name"] for p in (task.get("projects") or []) if p.get("name")]
         project_str = "; ".join(project_names) if project_names else "(none)"
         project_page_ids = [
             project_map[pn]["page_id"]
@@ -432,15 +435,15 @@ def sync() -> str:
                 }
                 notion_due = existing.get("due_date")
                 if notion_due and notion_due != due_on:
-                    # Notion has a date that differs from Asana → push to Asana
+                    # Notion has a date that differs from Asana â†’ push to Asana
                     a_update_task_due(gid, notion_due)
                     counts["due_date_pushed"] += 1
                     log.info(
-                        "  Due date pushed to Asana for '%s': %s → %s",
+                        "  Due date pushed to Asana for '%s': %s â†’ %s",
                         name, due_on, notion_due,
                     )
                 elif not notion_due and due_on:
-                    # Notion has no date but Asana does → populate Notion
+                    # Notion has no date but Asana does â†’ populate Notion
                     props["Due Date"] = n_date(due_on)
                 # Only touch Domains if the page has none set yet
                 if not existing["has_domains"]:
@@ -448,7 +451,7 @@ def sync() -> str:
                 n_update_page(existing["page_id"], props)
                 counts["updated"] += 1
 
-            # Status == "Done" → skip; don't re-open a closed task
+            # Status == "Done" â†’ skip; don't re-open a closed task
 
         except Exception as exc:
             log.error("  Failed to sync task '%s' (%s): %s", name, gid, exc)
@@ -458,8 +461,8 @@ def sync() -> str:
         counts["new"], counts["updated"], counts["new_projects"],
     )
 
-    # PART 2: Notion → Asana (push completions)
-    log.info("Part 2: Pushing Notion 'Done' tasks → Asana...")
+    # PART 2: Notion â†’ Asana (push completions)
+    log.info("Part 2: Pushing Notion 'Done' tasks â†’ Asana...")
     done_pages = n_query(
         ALL_TASKS_DB,
         {
@@ -532,7 +535,7 @@ def merge_duplicate_projects(dry_run: bool = False) -> None:
 
     For each duplicate group:
       1. Pick the first page as canonical.
-      2. Re-point every task's Projects relation from each dupe → canonical.
+      2. Re-point every task's Projects relation from each dupe â†’ canonical.
       3. Copy block content from each dupe into canonical (with a divider).
       4. Archive each dupe.
 
@@ -557,12 +560,12 @@ def merge_duplicate_projects(dry_run: bool = False) -> None:
 
     log.info("Found %d duplicate project name(s):", len(dupes))
     for name, pages in dupes.items():
-        log.info("  '%s' — %d copies", name, len(pages))
+        log.info("  '%s' â€” %d copies", name, len(pages))
 
     for name, pages in dupes.items():
         canonical = pages[0]
         canonical_id = canonical["id"]
-        log.info("\nMerging '%s' — keeping %s", name, canonical_id)
+        log.info("\nMerging '%s' â€” keeping %s", name, canonical_id)
 
         for dupe in pages[1:]:
             dupe_id = dupe["id"]
@@ -595,7 +598,7 @@ def merge_duplicate_projects(dry_run: bool = False) -> None:
                                 "rich_text": [{"type": "text", "text": {
                                     "content": f"Merged from duplicate page {dupe_id}"
                                 }}],
-                                "icon": {"type": "emoji", "emoji": "🔀"},
+                                "icon": {"type": "emoji", "emoji": "ðŸ”€"},
                                 "color": "gray_background",
                             },
                         },
@@ -608,7 +611,7 @@ def merge_duplicate_projects(dry_run: bool = False) -> None:
                 n_archive_page(dupe_id)
 
     if dry_run:
-        log.info("\nDRY RUN complete — no changes made.")
+        log.info("\nDRY RUN complete â€” no changes made.")
     else:
         log.info("\nMerge complete.")
 
@@ -645,7 +648,7 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--merge-dupes":
         dry_run = "--dry-run" in sys.argv
         if dry_run:
-            log.info("DRY RUN mode — no changes will be made")
+            log.info("DRY RUN mode â€” no changes will be made")
         merge_duplicate_projects(dry_run=dry_run)
     else:
         sync()
