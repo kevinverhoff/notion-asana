@@ -210,6 +210,40 @@ def plain_text(prop: dict, prop_type: str = "rich_text") -> str:
     return "".join(t.get("plain_text", "") for t in prop.get(prop_type, []))
 
 
+def _heading_block(text: str) -> dict:
+    return {"type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": text}}]}}
+
+
+def _paragraph_block(text: str) -> dict:
+    return {"type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": text}}]}}
+
+
+def _todo_block(text: str, checked: bool) -> dict:
+    return {
+        "type": "to_do",
+        "to_do": {"rich_text": [{"text": {"content": text}}], "checked": checked},
+    }
+
+
+def build_content_blocks(notes: str, subtasks: list[dict]) -> list[dict]:
+    """Build Notion blocks porting over an Asana description and subtasks (as checkboxes)."""
+    blocks: list[dict] = []
+
+    notes_lines = [line for line in (notes or "").splitlines() if line.strip()]
+    if notes_lines:
+        blocks.append(_heading_block("Description"))
+        blocks.extend(_paragraph_block(line) for line in notes_lines)
+
+    if subtasks:
+        blocks.append(_heading_block("Subtasks"))
+        blocks.extend(
+            _todo_block(st.get("name", ""), bool(st.get("completed")))
+            for st in subtasks
+        )
+
+    return blocks
+
+
 # â”€â”€ Asana helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _retry = Retry(
@@ -265,7 +299,10 @@ def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
     params: dict = {
         "assignee.any": ASANA_USER_GID,
         "completed": "false",
-        "opt_fields": "gid,name,due_on,projects,projects.name,permalink_url,completed,modified_at",
+        "opt_fields": (
+            "gid,name,due_on,projects,projects.name,permalink_url,completed,"
+            "modified_at,notes,num_subtasks"
+        ),
         "limit": 100,
     }
     while True:
@@ -276,6 +313,20 @@ def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
             break
         params["offset"] = next_page["offset"]
     return tasks
+
+
+def asana_fetch_subtasks(gid: str) -> list[dict]:
+    """Fetch all subtasks (name, completed) for an Asana task, paginating as needed."""
+    subtasks: list[dict] = []
+    params: dict = {"opt_fields": "name,completed", "limit": 100}
+    while True:
+        data = a_get(f"/tasks/{gid}/subtasks", params)
+        subtasks.extend(data.get("data", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        params["offset"] = next_page["offset"]
+    return subtasks
 
 
 # â”€â”€ Project helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -318,6 +369,7 @@ def sync() -> str:
         "pushed": 0,
         "done_from_asana": 0,
         "due_date_pushed": 0,
+        "content_backfilled": 0,
     }
 
     # PART 0: Refresh project mapping
@@ -397,6 +449,8 @@ def sync() -> str:
         name = task.get("name", "")
         due_on = task.get("due_on")
         permalink = task.get("permalink_url", "")
+        notes = task.get("notes") or ""
+        has_asana_content = bool(notes.strip()) or bool(task.get("num_subtasks"))
         project_names = [p["name"] for p in (task.get("projects") or []) if p.get("name")]
         project_str = "; ".join(project_names) if project_names else "(none)"
         project_page_ids = [
@@ -422,8 +476,14 @@ def sync() -> str:
                 }
                 if due_on:
                     props["Due Date"] = n_date(due_on)
-                n_create_page(ALL_TASKS_DB, props)
+                new_page = n_create_page(ALL_TASKS_DB, props)
                 counts["new"] += 1
+
+                if has_asana_content:
+                    blocks = build_content_blocks(notes, asana_fetch_subtasks(gid))
+                    if blocks:
+                        n_append_blocks(new_page["id"], blocks)
+                        counts["content_backfilled"] += 1
 
             elif existing["status"] != "Done":
                 props = {
@@ -450,6 +510,14 @@ def sync() -> str:
                     props["Domains"] = n_relation([KTAF_DOMAIN_PAGE_ID])
                 n_update_page(existing["page_id"], props)
                 counts["updated"] += 1
+
+                # Retroactive backfill: only touch pages that are still empty,
+                # so any existing notes in Notion (manual or otherwise) are left alone.
+                if has_asana_content and not n_get_blocks(existing["page_id"]):
+                    blocks = build_content_blocks(notes, asana_fetch_subtasks(gid))
+                    if blocks:
+                        n_append_blocks(existing["page_id"], blocks)
+                        counts["content_backfilled"] += 1
 
             # Status == "Done" â†’ skip; don't re-open a closed task
 
@@ -523,7 +591,8 @@ def sync() -> str:
         f"Pull: {counts['new']} new, {counts['updated']} updated. "
         f"Projects: {counts['new_projects']} new (add Tasks + Meeting Notes views manually). "
         f"Push: {counts['pushed']} closed in Asana, {counts['due_date_pushed']} due dates updated in Asana. "
-        f"{counts['done_from_asana']} marked Done from Asana side."
+        f"{counts['done_from_asana']} marked Done from Asana side. "
+        f"{counts['content_backfilled']} page(s) backfilled with Asana description/subtasks."
     )
     print(summary)
     return summary
