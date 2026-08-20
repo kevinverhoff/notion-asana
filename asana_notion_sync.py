@@ -16,6 +16,7 @@ Dependencies:
     pip install requests python-dotenv
 """
 
+import json
 import os
 import sys
 import logging
@@ -78,6 +79,32 @@ ASANA_HEADERS = {
     "Accept": "application/json",
 }
 
+# â”€â”€ TEMPORARY: API usage tracking (remove once the call/data question is answered) â”€â”€
+
+_api_stats: dict[str, dict[str, int]] = {
+    "notion": {"calls": 0, "bytes_sent": 0, "bytes_received": 0},
+    "asana": {"calls": 0, "bytes_sent": 0, "bytes_received": 0},
+}
+
+
+def _track(service: str, req_body: Optional[dict], resp: requests.Response) -> None:
+    stats = _api_stats[service]
+    stats["calls"] += 1
+    if req_body is not None:
+        stats["bytes_sent"] += len(json.dumps(req_body).encode("utf-8"))
+    stats["bytes_received"] += len(resp.content)
+
+
+def print_api_stats() -> None:
+    print("\nAPI usage this run:")
+    for service, stats in _api_stats.items():
+        total_kb = (stats["bytes_sent"] + stats["bytes_received"]) / 1024
+        print(
+            f"  {service.capitalize()}: {stats['calls']} calls, "
+            f"{stats['bytes_sent']:,} bytes sent / {stats['bytes_received']:,} bytes received "
+            f"({total_kb:.1f} KB total)"
+        )
+
 
 # â”€â”€ Notion helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -93,6 +120,7 @@ def n_query(db_id: str, filter_payload: Optional[dict] = None) -> list[dict]:
             headers=NOTION_HEADERS,
             json=payload,
         )
+        _track("notion", payload, r)
         r.raise_for_status()
         body = r.json()
         results.extend(body.get("results", []))
@@ -103,31 +131,37 @@ def n_query(db_id: str, filter_payload: Optional[dict] = None) -> list[dict]:
 
 
 def n_create_page(db_id: str, props: dict) -> dict:
+    body = {"parent": {"database_id": db_id}, "properties": props}
     r = requests.post(
         f"{NOTION_API}/pages",
         headers=NOTION_HEADERS,
-        json={"parent": {"database_id": db_id}, "properties": props},
+        json=body,
     )
+    _track("notion", body, r)
     r.raise_for_status()
     return r.json()
 
 
 def n_update_page(page_id: str, props: dict) -> dict:
+    body = {"properties": props}
     r = requests.patch(
         f"{NOTION_API}/pages/{page_id}",
         headers=NOTION_HEADERS,
-        json={"properties": props},
+        json=body,
     )
+    _track("notion", body, r)
     r.raise_for_status()
     return r.json()
 
 
 def n_archive_page(page_id: str) -> None:
+    body = {"archived": True}
     r = requests.patch(
         f"{NOTION_API}/pages/{page_id}",
         headers=NOTION_HEADERS,
-        json={"archived": True},
+        json=body,
     )
+    _track("notion", body, r)
     r.raise_for_status()
 
 
@@ -141,6 +175,7 @@ def n_get_blocks(page_id: str) -> list[dict]:
             headers=NOTION_HEADERS,
             params=params,
         )
+        _track("notion", None, r)
         r.raise_for_status()
         body = r.json()
         blocks.extend(body.get("results", []))
@@ -173,11 +208,13 @@ def n_append_blocks(page_id: str, blocks: list[dict]) -> None:
     if not clean:
         return
     for i in range(0, len(clean), 100):
+        body = {"children": clean[i : i + 100]}
         r = requests.patch(
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
-            json={"children": clean[i : i + 100]},
+            json=body,
         )
+        _track("notion", body, r)
         r.raise_for_status()
 
 
@@ -261,27 +298,32 @@ def a_get(path: str, params: Optional[dict] = None) -> dict:
     r = _asana_session.get(
         f"{ASANA_API}{path}", headers=ASANA_HEADERS, params=params, timeout=30
     )
+    _track("asana", None, r)
     r.raise_for_status()
     return r.json()
 
 
 def a_update_task_due(gid: str, due_on: Optional[str]) -> None:
+    body = {"data": {"due_on": due_on}}
     r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
         headers=ASANA_HEADERS,
-        json={"data": {"due_on": due_on}},
+        json=body,
         timeout=30,
     )
+    _track("asana", body, r)
     r.raise_for_status()
 
 
 def a_update_task(gid: str, completed: bool) -> None:
+    body = {"data": {"completed": completed}}
     r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
         headers=ASANA_HEADERS,
-        json={"data": {"completed": completed}},
+        json=body,
         timeout=30,
     )
+    _track("asana", body, r)
     r.raise_for_status()
 
 
@@ -691,6 +733,7 @@ def discover():
     results, payload = [], {"filter": {"value": "database", "property": "object"}, "page_size": 100}
     while True:
         r = requests.post(f"{NOTION_API}/search", headers=NOTION_HEADERS, json=payload)
+        _track("notion", payload, r)
         r.raise_for_status()
         body = r.json()
         results.extend(body.get("results", []))
@@ -721,3 +764,4 @@ if __name__ == "__main__":
         merge_duplicate_projects(dry_run=dry_run)
     else:
         sync()
+    print_api_stats()
