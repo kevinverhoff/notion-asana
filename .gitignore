@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Asana/Notion sync baseline and conflict log
+.sync_state.json
+.sync_state.json.tmp
+logs/

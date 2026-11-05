@@ -4,13 +4,23 @@ Asana <-> Notion bidirectional task sync.
 
 Pulls new/changed Asana tasks into the Notion "All Tasks" database.
 Closes Asana tasks that are marked Done in Notion.
+Closes Notion projects whose Asana project is completed or archived.
+Reconciles due dates in both directions, asking before overwriting a conflict.
 Schedule at 8 AM and 5 PM daily.
 
 Usage:
     Create a .env file with:
         ASANA_TOKEN=<personal access token>
         NOTION_TOKEN=<integration token>
-    python asana_notion_sync.py
+    python asana_notion_sync.py              # full sync
+    python asana_notion_sync.py --dry-run    # report changes, write nothing
+    python asana_notion_sync.py --no-prompt  # never ask; log conflicts instead
+
+Due dates are reconciled against a baseline of what both sides agreed on at the
+end of the last run, kept in .sync_state.json. If only one side moved a date,
+that change wins automatically. If both moved, it is a conflict: you are asked
+which to keep when running in a terminal, and it is logged and left untouched
+otherwise.
 
 Dependencies:
     pip install requests python-dotenv
@@ -21,6 +31,7 @@ import os
 import sys
 import logging
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -79,6 +90,17 @@ ASANA_HEADERS = {
     "Accept": "application/json",
 }
 
+# Baseline of what Asana and Notion agreed on at the end of the last run, so a
+# one-sided change can be told apart from a genuine two-sided conflict.
+SCRIPT_DIR = Path(__file__).resolve().parent
+STATE_FILE = SCRIPT_DIR / ".sync_state.json"
+CONFLICT_LOG = SCRIPT_DIR / "logs" / "conflicts.json"
+STATE_VERSION = 1
+
+# Set from the command line in __main__.
+DRY_RUN = False
+ALLOW_PROMPT = True
+
 # â”€â”€ TEMPORARY: API usage tracking (remove once the call/data question is answered) â”€â”€
 
 _api_stats: dict[str, dict[str, int]] = {
@@ -95,6 +117,11 @@ def _track(service: str, req_body: Optional[dict], resp: requests.Response) -> N
     stats["bytes_received"] += len(resp.content)
 
 
+def did(verb: str) -> str:
+    """Phrase an action log line correctly for a real run or a dry run."""
+    return f"would {verb.lower()}" if DRY_RUN else verb
+
+
 def print_api_stats() -> None:
     print("\nAPI usage this run:")
     for service, stats in _api_stats.items():
@@ -104,6 +131,191 @@ def print_api_stats() -> None:
             f"{stats['bytes_sent']:,} bytes sent / {stats['bytes_received']:,} bytes received "
             f"({total_kb:.1f} KB total)"
         )
+
+
+# â”€â”€ Sync state (last-agreed baseline) âââââââââââââââââââââââââââââââââââ
+
+def load_state() -> dict:
+    """
+    Load the last-agreed baseline, or an empty one on a first run.
+
+    A missing or unreadable file is not an error: the run just has no baseline,
+    so every difference is treated as a conflict rather than guessed at.
+    """
+    if not STATE_FILE.exists():
+        log.info("No sync state file yet - this run will establish the baseline.")
+        return {"version": STATE_VERSION, "tasks": {}, "projects": {}}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not read %s (%s) - starting from an empty baseline.", STATE_FILE.name, exc)
+        return {"version": STATE_VERSION, "tasks": {}, "projects": {}}
+    state.setdefault("tasks", {})
+    state.setdefault("projects", {})
+    return state
+
+
+def save_state(state: dict) -> None:
+    """Write the baseline atomically, so an interrupted run can't truncate it."""
+    if DRY_RUN:
+        log.info("[dry-run] would save sync state (%d task baselines)", len(state.get("tasks", {})))
+        return
+    state["version"] = STATE_VERSION
+    state["last_sync"] = datetime.now().isoformat(timespec="seconds")
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except OSError as exc:
+        log.error("Could not save sync state to %s: %s", STATE_FILE, exc)
+
+
+def record_due_baseline(state: dict, gid: str, due) -> None:
+    """Remember the due date both sides agree on, now that they do."""
+    state["tasks"].setdefault(gid, {})["due"] = due
+
+
+# â”€â”€ Conflict handling âââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+_conflicts: list[dict] = []
+
+# Remembers an "apply to all remaining" answer for the rest of the run.
+_sticky_choice: Optional[str] = None
+
+
+def can_prompt() -> bool:
+    """True when there is a human on the other end of stdin to ask."""
+    return ALLOW_PROMPT and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _fmt(value: Optional[str]) -> str:
+    return value if value else "(none)"
+
+
+def resolve_due_conflict(
+    name: str,
+    gid: str,
+    link: str,
+    asana_due: Optional[str],
+    notion_due: Optional[str],
+    baseline: Optional[str],
+    had_baseline: bool,
+) -> str:
+    """
+    Decide which side's due date wins. Returns "asana", "notion" or "skip".
+
+    Asks when a terminal is attached; otherwise records the conflict and skips,
+    so an unattended run never silently picks a side.
+    """
+    global _sticky_choice
+
+    record = {
+        "task": name,
+        "asana_id": gid,
+        "asana_link": link,
+        "asana_due": asana_due,
+        "notion_due": notion_due,
+        "baseline": baseline if had_baseline else None,
+        "reason": "both sides changed" if had_baseline else "no baseline to compare against",
+    }
+
+    if _sticky_choice:
+        record["resolution"] = _sticky_choice
+        _conflicts.append(record)
+        return _sticky_choice
+
+    if not can_prompt():
+        record["resolution"] = "skip"
+        _conflicts.append(record)
+        log.warning(
+            "  CONFLICT (left unchanged): '%s' - Asana %s vs Notion %s",
+            name, _fmt(asana_due), _fmt(notion_due),
+        )
+        return "skip"
+
+    was = f"both were {_fmt(baseline)} at last sync" if had_baseline else "no record of a previous sync"
+    print("\n" + "-" * 72)
+    print(f"Due-date conflict: {name}")
+    print(f"  Asana : {_fmt(asana_due)}")
+    print(f"  Notion: {_fmt(notion_due)}")
+    print(f"  ({was})")
+    if link:
+        print(f"  {link}")
+    print("  [a] keep Asana   [n] keep Notion   [s] skip")
+    print("  [A] keep Asana for all remaining   [N] keep Notion for all remaining")
+
+    choice = "skip"
+    while True:
+        try:
+            answer = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if answer in ("A", "N"):
+            choice = _sticky_choice = "asana" if answer == "A" else "notion"
+            break
+        if answer in ("a", "n", "s"):
+            choice = {"a": "asana", "n": "notion", "s": "skip"}[answer]
+            break
+        print("  Please enter a, n, s, A or N.")
+
+    record["resolution"] = choice
+    _conflicts.append(record)
+    return choice
+
+
+def choose_due_winner(
+    state: dict,
+    gid: str,
+    name: str,
+    link: str,
+    asana_due: Optional[str],
+    notion_due: Optional[str],
+) -> str:
+    """
+    Decide whose due date to keep: "agree", "asana", "notion" or "skip".
+
+    Compares both sides against the baseline from the last run. If only one
+    side moved, that side wins. If both moved, or there is no baseline and both
+    hold a real date, it's a conflict and resolve_due_conflict() decides.
+    """
+    if notion_due == asana_due:
+        return "agree"
+
+    entry = state["tasks"].get(gid, {})
+    had_baseline = "due" in entry
+    baseline = entry.get("due")
+
+    if had_baseline and notion_due == baseline:
+        return "asana"   # only Asana moved
+    if had_baseline and asana_due == baseline:
+        return "notion"  # only Notion moved
+    if not had_baseline and not notion_due:
+        return "asana"   # nothing in Notion to overwrite
+    if not had_baseline and not asana_due:
+        return "notion"  # nothing in Asana to overwrite
+
+    return resolve_due_conflict(
+        name, gid, link, asana_due, notion_due, baseline, had_baseline
+    )
+
+
+def write_conflict_log() -> None:
+    """Persist this run's conflicts so an unattended run leaves a trail."""
+    if not _conflicts or DRY_RUN:
+        return
+    try:
+        CONFLICT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        CONFLICT_LOG.write_text(
+            json.dumps(
+                {"run": datetime.now().isoformat(timespec="seconds"), "conflicts": _conflicts},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log.info("  %d conflict(s) written to %s", len(_conflicts), CONFLICT_LOG)
+    except OSError as exc:
+        log.error("Could not write conflict log: %s", exc)
 
 
 # â”€â”€ Notion helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -130,7 +342,25 @@ def n_query(db_id: str, filter_payload: Optional[dict] = None) -> list[dict]:
     return results
 
 
+_dry_run_seq = 0
+
+
 def n_create_page(db_id: str, props: dict) -> dict:
+    global _dry_run_seq
+    if DRY_RUN:
+        _dry_run_seq += 1
+        # Props being sent are request-shaped ({"text": {"content": ...}}),
+        # not the response shape plain_text() reads.
+        title = next(
+            (
+                "".join(t.get("text", {}).get("content", "") for t in p["title"])
+                for p in props.values()
+                if "title" in p
+            ),
+            "(untitled)",
+        )
+        log.info("  [dry-run] would create Notion page '%s'", title)
+        return {"id": f"dry-run-{_dry_run_seq}", "url": ""}
     body = {"parent": {"database_id": db_id}, "properties": props}
     r = requests.post(
         f"{NOTION_API}/pages",
@@ -143,6 +373,9 @@ def n_create_page(db_id: str, props: dict) -> dict:
 
 
 def n_update_page(page_id: str, props: dict) -> dict:
+    if DRY_RUN:
+        log.info("  [dry-run] would update Notion page %s: %s", page_id, ", ".join(sorted(props)))
+        return {}
     body = {"properties": props}
     r = requests.patch(
         f"{NOTION_API}/pages/{page_id}",
@@ -155,6 +388,9 @@ def n_update_page(page_id: str, props: dict) -> dict:
 
 
 def n_archive_page(page_id: str) -> None:
+    if DRY_RUN:
+        log.info("  [dry-run] would archive Notion page %s", page_id)
+        return
     body = {"archived": True}
     r = requests.patch(
         f"{NOTION_API}/pages/{page_id}",
@@ -206,6 +442,9 @@ def n_append_blocks(page_id: str, blocks: list[dict]) -> None:
     clean = [_clean_block(b) for b in blocks]
     clean = [b for b in clean if b is not None]
     if not clean:
+        return
+    if DRY_RUN:
+        log.info("  [dry-run] would append %d block(s) to %s", len(clean), page_id)
         return
     for i in range(0, len(clean), 100):
         body = {"children": clean[i : i + 100]}
@@ -304,6 +543,9 @@ def a_get(path: str, params: Optional[dict] = None) -> dict:
 
 
 def a_update_task_due(gid: str, due_on: Optional[str]) -> None:
+    if DRY_RUN:
+        log.info("  [dry-run] would set Asana task %s due date to %s", gid, due_on)
+        return
     body = {"data": {"due_on": due_on}}
     r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
@@ -316,6 +558,9 @@ def a_update_task_due(gid: str, due_on: Optional[str]) -> None:
 
 
 def a_update_task(gid: str, completed: bool) -> None:
+    if DRY_RUN:
+        log.info("  [dry-run] would set Asana task %s completed=%s", gid, completed)
+        return
     body = {"data": {"completed": completed}}
     r = _asana_session.put(
         f"{ASANA_API}/tasks/{gid}",
@@ -336,11 +581,19 @@ def asana_workspace_gid() -> str:
 
 
 def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
-    """Fetch all incomplete tasks assigned to me, paginating as needed."""
+    """
+    Fetch all incomplete tasks assigned to me, paginating as needed.
+
+    Uses /tasks rather than /workspaces/{gid}/tasks/search: the search endpoint
+    caps at 100 results and never returns a next_page, so paginating it is
+    impossible and everything past the first 100 is invisible to the sync.
+    completed_since=now restricts this to tasks that are still open.
+    """
     tasks: list[dict] = []
     params: dict = {
-        "assignee.any": ASANA_USER_GID,
-        "completed": "false",
+        "assignee": ASANA_USER_GID,
+        "workspace": workspace_gid,
+        "completed_since": "now",
         "opt_fields": (
             "gid,name,due_on,projects,projects.name,permalink_url,completed,"
             "modified_at,notes,num_subtasks"
@@ -348,13 +601,38 @@ def asana_fetch_incomplete_tasks(workspace_gid: str) -> list[dict]:
         "limit": 100,
     }
     while True:
-        data = a_get(f"/workspaces/{workspace_gid}/tasks/search", params)
+        data = a_get("/tasks", params)
         tasks.extend(data.get("data", []))
         next_page = data.get("next_page")
         if not next_page:
             break
         params["offset"] = next_page["offset"]
-    return tasks
+    # completed_since is a lower bound, not a filter, so drop anything already
+    # closed rather than trusting the server to have excluded it.
+    return [t for t in tasks if not t.get("completed")]
+
+
+def asana_fetch_projects(workspace_gid: str) -> list[dict]:
+    """
+    Fetch every project in the workspace, paginating as needed.
+
+    The task search only returns incomplete tasks, so a finished project has
+    nothing left to surface it. Listing projects directly is the only way to
+    see one that was completed or archived.
+    """
+    projects: list[dict] = []
+    params: dict = {
+        "opt_fields": "gid,name,archived,completed,completed_at,permalink_url",
+        "limit": 100,
+    }
+    while True:
+        data = a_get(f"/workspaces/{workspace_gid}/projects", params)
+        projects.extend(data.get("data", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        params["offset"] = next_page["offset"]
+    return projects
 
 
 def asana_fetch_subtasks(gid: str) -> list[dict]:
@@ -411,8 +689,13 @@ def sync() -> str:
         "pushed": 0,
         "done_from_asana": 0,
         "due_date_pushed": 0,
+        "due_date_pulled": 0,
+        "due_conflicts": 0,
+        "projects_closed": 0,
         "content_backfilled": 0,
     }
+
+    state = load_state()
 
     # PART 0: Refresh project mapping
     log.info("Part 0: Loading Notion project map...")
@@ -520,6 +803,7 @@ def sync() -> str:
                     props["Due Date"] = n_date(due_on)
                 new_page = n_create_page(ALL_TASKS_DB, props)
                 counts["new"] += 1
+                record_due_baseline(state, gid, due_on)
 
                 if has_asana_content:
                     blocks = build_content_blocks(notes, asana_fetch_subtasks(gid))
@@ -535,18 +819,35 @@ def sync() -> str:
                     "Last Synced": n_date(TODAY),
                     "Projects": n_relation(project_page_ids),
                 }
+                # Due dates: reconcile against what both sides agreed on last
+                # run, so a change made in Asana is no longer steamrolled by
+                # whatever Notion happens to hold.
                 notion_due = existing.get("due_date")
-                if notion_due and notion_due != due_on:
-                    # Notion has a date that differs from Asana â†’ push to Asana
+                winner = choose_due_winner(state, gid, name, permalink, due_on, notion_due)
+
+                if winner == "agree":
+                    record_due_baseline(state, gid, due_on)
+                elif winner == "asana":
+                    props["Due Date"] = n_date(due_on)
+                    counts["due_date_pulled"] += 1
+                    log.info(
+                        "  Due date %s in Notion for '%s': %s -> %s",
+                        did("Set"), name, notion_due or "(none)", due_on or "(none)",
+                    )
+                    record_due_baseline(state, gid, due_on)
+                elif winner == "notion":
                     a_update_task_due(gid, notion_due)
                     counts["due_date_pushed"] += 1
                     log.info(
-                        "  Due date pushed to Asana for '%s': %s â†’ %s",
-                        name, due_on, notion_due,
+                        "  Due date %s in Asana for '%s': %s -> %s",
+                        did("Set"), name, due_on or "(none)", notion_due or "(none)",
                     )
-                elif not notion_due and due_on:
-                    # Notion has no date but Asana does â†’ populate Notion
-                    props["Due Date"] = n_date(due_on)
+                    record_due_baseline(state, gid, notion_due)
+                else:
+                    # Unresolved: leave both sides alone and keep the old
+                    # baseline, so the same conflict is raised again next run.
+                    counts["due_conflicts"] += 1
+
                 # Only touch Domains if the page has none set yet
                 if not existing["has_domains"]:
                     props["Domains"] = n_relation([KTAF_DOMAIN_PAGE_ID])
@@ -590,7 +891,7 @@ def sync() -> str:
             a_update_task(asana_id, completed=True)
             n_update_page(page["id"], {"Last Synced": n_date(TODAY)})
             counts["pushed"] += 1
-            log.info("  Closed Asana task %s", asana_id)
+            log.info("  %s Asana task %s", did("Closed"), asana_id)
         except Exception as exc:
             log.error("  Failed to close Asana task %s: %s", asana_id, exc)
 
@@ -625,17 +926,67 @@ def sync() -> str:
 
     log.info("Part 3 done: %d marked Done from Asana side", counts["done_from_asana"])
 
+    # PART 4: Asana project closed -> close the matching Notion project
+    log.info("Part 4: Checking for Asana projects that are completed or archived...")
+    try:
+        asana_projects = asana_fetch_projects(workspace_gid)
+    except Exception as exc:
+        log.error("  Could not list Asana projects: %s", exc)
+        asana_projects = []
+    log.info("  %d Asana projects fetched", len(asana_projects))
+
+    # Notion projects carry no Asana ID, so they are matched on name, the same
+    # way Part 1 matches them when creating.
+    asana_by_name: dict[str, list[dict]] = {}
+    for proj in asana_projects:
+        pname = (proj.get("name") or "").strip()
+        if pname:
+            asana_by_name.setdefault(pname, []).append(proj)
+
+    for page in project_pages:
+        pname = plain_text(page["properties"].get("Project Name", {}), "title").strip()
+        if not pname:
+            continue
+        current = (page["properties"].get("Project Status") or {}).get("select") or {}
+        if current.get("name") == "Complete":
+            continue
+        twins = asana_by_name.get(pname)
+        if not twins:
+            continue
+        # Require every Asana project sharing the name to be done, so a name
+        # reused by a project that is still running doesn't close the page.
+        if not all(t.get("completed") or t.get("archived") for t in twins):
+            continue
+        reason = "completed" if any(t.get("completed") for t in twins) else "archived"
+        try:
+            n_update_page(page["id"], {"Project Status": n_select("Complete")})
+            counts["projects_closed"] += 1
+            log.info("  %s Notion project '%s' (%s in Asana)", did("Closed"), pname, reason)
+        except Exception as exc:
+            log.error("  Failed to close Notion project '%s': %s", pname, exc)
+
+    log.info("Part 4 done: %d project(s) closed in Notion", counts["projects_closed"])
+
+    save_state(state)
+    write_conflict_log()
+
     # Summary line
     total_synced = counts["new"] + counts["updated"]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     summary = (
         f"Synced {total_synced} tasks at {timestamp}. "
         f"Pull: {counts['new']} new, {counts['updated']} updated. "
-        f"Projects: {counts['new_projects']} new (add Tasks + Meeting Notes views manually). "
-        f"Push: {counts['pushed']} closed in Asana, {counts['due_date_pushed']} due dates updated in Asana. "
+        f"Projects: {counts['new_projects']} new (add Tasks + Meeting Notes views manually), "
+        f"{counts['projects_closed']} closed from Asana. "
+        f"Push: {counts['pushed']} closed in Asana. "
+        f"Due dates: {counts['due_date_pulled']} pulled from Asana, "
+        f"{counts['due_date_pushed']} pushed to Asana, "
+        f"{counts['due_conflicts']} unresolved. "
         f"{counts['done_from_asana']} marked Done from Asana side. "
         f"{counts['content_backfilled']} page(s) backfilled with Asana description/subtasks."
     )
+    if DRY_RUN:
+        summary = "[DRY RUN - nothing was written] " + summary
     print(summary)
     return summary
 
@@ -754,14 +1105,41 @@ def discover():
         print()
 
 
+USAGE = """Usage: python asana_notion_sync.py [command] [options]
+
+Commands:
+  (none)          Run the full two-way sync.
+  --discover      List the Notion databases this integration can see.
+  --merge-dupes   Merge Notion project pages that share a name.
+
+Options:
+  --dry-run       Report what would change without writing anything.
+  --no-prompt     Never ask about conflicts; log them and leave both sides alone.
+  -h, --help      Show this message.
+"""
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--discover":
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(USAGE)
+        sys.exit(0)
+
+    DRY_RUN = "--dry-run" in args
+    ALLOW_PROMPT = "--no-prompt" not in args
+
+    if DRY_RUN:
+        log.info("DRY RUN mode - no changes will be made")
+
+    if "--discover" in args:
         discover()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--merge-dupes":
-        dry_run = "--dry-run" in sys.argv
-        if dry_run:
-            log.info("DRY RUN mode â€” no changes will be made")
-        merge_duplicate_projects(dry_run=dry_run)
+    elif "--merge-dupes" in args:
+        merge_duplicate_projects(dry_run=DRY_RUN)
     else:
+        if not ALLOW_PROMPT:
+            log.info("Prompting disabled - conflicts will be logged, not resolved")
+        elif not can_prompt():
+            log.info("No terminal attached - conflicts will be logged, not resolved")
         sync()
     print_api_stats()
